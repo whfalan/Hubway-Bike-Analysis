@@ -1,0 +1,198 @@
+---
+title: "Data Preperation for Hubway Project"
+output: html_notebook
+---
+```{r}
+library(RMySQL)
+library(gmapsdistance)
+library(mice)
+library(Amelia)
+library(outliers)
+library(geosphere)
+library(dummies)
+```
+# Data Acquisition
+Import the csv file into a dataframe
+```{r}
+tripsdf <- read.csv(file.path("~/Downloads/201803_hubway_tripdata.csv"),
+               stringsAsFactors = TRUE, na.strings=c("", "NA", "NULL"))
+
+```
+
+Add columns with google map time and and distance between the stations. This phase took the longest due to the amount of time it took for each api request to return a result from the Google Distance Matrix. Furthermore due to the 2,500 daily request limit with each API key, i had to use a total of 16 different API keys to complete the process.
+```{r}
+set.api.key("AIzaSyBgM_tCMDbhVPWdbsNQW-inWNBu9711yUk")
+for (i in which(is.na(tripsdf[,"gtime"]))){
+  result <- gmapsdistance(origin = paste0(tripsdf[i, "start.station.latitude"], "+", tripsdf[i, "start.station.longitude"]),
+                          destination = paste0(tripsdf[i, "end.station.latitude"], "+", tripsdf[i, "end.station.longitude"]), 
+                          mode = "bicycling")
+  tripsdf[i, "gtime"] <- result$Time
+  tripsdf[i, "gdist"] <- result$Distance
+}
+```
+
+## Data Exploration
+### Creating histogram
+Converting all durations over 3000 to 3000 to create a bin of all durations >= 3000
+```{r}
+durations <- tripsdf$tripduration
+durations[durations > 3000] <- 3000
+```
+Plotting the histogram with the data from above, created the >=3000 bin to make it easier to read the histogram rather than having bins of size 1 with some of the bins > 3000
+```{r}
+qplot(durations, geom = "histogram", breaks = seq(0, 3000, 100), 
+      colour = I("grey"), fill = I("grey"))
+```
+The above histogram shows that the tripduration data is slightly skewed to the right, by looking at the long tail to the right. This is expected as most people tend to rent Hubway bikes for short periods of time to move between places, rather than taking it for a long period of time.
+
+Scatterplot of trip duration vs birth year to assess the correlation between the two
+```{r}
+qplot(durations, y = tripsdf$birth.year, ylab = "birth year",
+      colour = I("grey"), fill = I("grey"))
+```
+This scatter pot shows that there are some outliers with the birth years that need to be removed. There are reported people using the hubway service, who are over 100 years old, which seem very unlikely, and may be caused by errors or intentional mistakes when the users entered the birth year. We will remove the cases with birth years earlier than 1930, assuming that people who are over 88 are not capable of renting bikes with Hubway.
+
+Another observation from this scatter plot is that there is a slight correlation between the age and the amount of time they rent the bikes, it seems like younger people tend to rent bikers for longer compared to older people.
+```{r}
+tripsdf <- tripsdf[tripsdf$birth.year > 1930,]
+```
+
+Making sure that they are removed
+```{r}
+min(tripsdf$birth.year, na.rm = TRUE)
+```
+
+Taking a look at the Spearman's rank correlation between birth year and duration to analyze the relationship between the two.
+```{r}
+cor.test(tripsdf$tripduration, tripsdf$birth.year,  method = "spearman")
+```
+As the scatter plot showed, spearman's rank correlation also shows that there is a very weak correlation between the trip duration and the age of the riders, which is expected.
+
+Another correlation to look at is between trip duration and the time it would take to go from the start station to end station according to google maps. I believe these two would have a strong correlation because most people who rent the bikes use it to get from one place to another and do not spend as much time with the bike on idle.
+```{r}
+cor.test(tripsdf$tripduration, tripsdf$gtime,  method = "spearman")
+```
+This shows that my hypothesis is correct, and there is a strong positive correlation between the trip duration and google maps time with the coefficient of 0.749
+
+Pairwise Correlations: Creating a pairwise correlation matrix to analyze the relationships between variables
+```{r}
+round(cor(tripsdf[, c(2,5,7,8,9,11,12,13,15,17,18,19)], use="complete.obs"),2)
+```
+From the correlation matrix, we can tell that the two most likely collinear are the gtime and gdist, which represent the google calculated time and distance, which makes sense since with biking there isn't traffic involved, so the two should be very much collinear. 
+So the gdist needs to be removed from regression analysis due to the collinearity.
+
+## Data Cleaning and Shaping:
+Check missing values
+```{r}
+missmap(tripsdf[, 1:15])
+```
+Most of the values are observed, However, there are a few birth years cases that are missing.
+Taking a look at the user types of the the cases where birth year is absent. Since birth year is self reported, it is possible that it is more frequent with regular customers.
+```{r}
+table(tripsdf[is.na(tripsdf$birth.year), "usertype"])
+```
+This shows that almost all of the users with missing birth year are customers, so we cannot simply disregard cases with missing birth year because it would cause an inbalance of customer and subcribers. We will have to impute the year.
+```{r}
+summary(tripsdf)
+```
+This shows that none of the "Customer" user type had their birth years recorded, which makes imputation more difficult, Since mice is extremely slow with a dataframe of this size, We will impute the birth years with the median of all the birth years.
+```{r}
+tripsdf[is.na(tripsdf$birth.year), "birth.year"] <- median(tripsdf[, "birth.year"], na.rm = TRUE)
+```
+Reconstruct missing value map to make sure it has been filled in
+```{r}
+missmap(tripsdf[, 1:15])
+```
+
+Another type of missing value is in gender, because it is self reported. However, it is not shown on the missingness map because it is coded with 0, 1, and 2, with 0 being missing values.
+```{r}
+table(tripsdf[, "gender"])
+```
+77% of the riders with reported genders are male, while the other 23% are female.
+So we will impute the missing genders by assuming the same distribution, with 77% being male (3741 cases), and the rest being female (1117 cases).
+```{r}
+tripsdf[tripsdf$gender == 0, "gender"][1:3741] <- 1
+tripsdf[tripsdf$gender == 0, "gender"] <- 2
+```
+Check again to make sure all genders are imputed
+```{r}
+table(tripsdf[, "gender"])
+```
+
+Finding outliers in tripduration using z score, if the z score is larger than 3 or less than -3, then it is considered an outlier. the outliers vector keeps track of all each entry and determines if an entry is an outlier by the z score.
+```{r}
+outliers <- abs(scores(tripsdf[, "tripduration"], type = "z", prob = NA, lim = NA)) > 3 
+outliers
+```
+Using the above, remove the outliers from the the dataframe, as extremely large values could just be a person forgetting to return the bike, or leaving the bike in the same place for a long time without using it or returning it. On the other hand, extremely small values can be just system errors or someone relocating the bike to a different dock.
+```{r}
+tripsdf <- tripsdf[!outliers, ]
+```
+
+Deriving distance between the start station and end station from the latitude and longitude as a new feature
+```{r}
+for (i in 1:nrow(tripsdf)){
+  tripsdf[i, "straightdist"] <- distm(c(tripsdf[i, "start.station.latitude"], tripsdf[i, "start.station.longitude"]), 
+                                      c(tripsdf[i, "end.station.latitude"],tripsdf[i, "end.station.longitude"]), 
+                                      fun =distHaversine)[1,1]
+}
+```
+We normalize this new derived feature using min-max normalization since the scale of the distance is not as important in hour case, rather we are comparing the distances covered during rental to each other.
+```{r}
+mindist <- min(tripsdf$straightdist)
+maxdist <- max(tripsdf$straightdist)
+tripsdf$straightdist <- (tripsdf$straightdist - mindist) / (maxdist - mindist)
+```
+
+Encoding the categorical variable user type to dummy codes
+```{r}
+tripsdf[, "Customer"] <- dummy(tripsdf$usertype)[, "usertypeCustomer"]
+tripsdf[, "Subscriber"] <- dummy(tripsdf$usertype)[, "usertypeSubscriber"]
+```
+
+Creating a seperate dataframe with the station information
+```{r}
+stations <- data.frame(matrix(ncol = 4, nrow = 1))
+colnames(stations) <- c("id", "stationname", "latitude", "longitude")
+for(i in 1:nrow(tripsdf)) {
+  if (! (tripsdf[i, "start.station.id"] %in% stations[, "id"])) {
+    inter <- data.frame(tripsdf[i, 4:7])
+    colnames(inter) <- c("id", "stationname", "latitude", "longitude")
+    stations <- rbind(stations, inter)
+  }
+  if (! (tripsdf[i, "end.station.id"] %in% stations[, "id"])) {
+    inter <- data.frame(tripsdf[i, 8:11])
+    colnames(inter) <- c("id", "stationname", "latitude", "longitude")
+    stations <- rbind(stations, inter)
+  }
+}
+```
+
+# Data Storage
+```{r}
+con <- dbConnect(MySQL(),
+         user="root", password="alan980820",
+         dbname="Hubway", host="localhost")
+```
+Storing station data into the database
+```{r}
+dbWriteTable(con, "Stations", stations, append = TRUE, row.names = FALSE)
+```
+Storing the trips data into the database
+```{r}
+# Preping the data frame to be stored
+trips <- tripsdf[, c("tripduration", "starttime", "stoptime", "start.station.id", "end.station.id", "bikeid", "Customer", "Subscriber", "birth.year", "gender")]
+colnames(trips) <- c("duration", "starttime", "stoptime", "startstation", "endstation", "bikeid", "customer", "subscriber", "birthyear", "gender")
+
+dbWriteTable(con, "Trips", trips, append = TRUE, row.names = FALSE)
+```
+Storing the Google distance matrix api data into the database
+```{r}
+# Creating seperate data frame for the google calculated data
+google <- tripsdf[, c("gtime", "gdist")]
+google[, "id"] <- as.numeric(row.names(tripsdf))
+colnames(google) <- c("duration", "shortestdistance", "id")
+
+dbWriteTable(con, "Google", google, append = TRUE, row.names = FALSE)
+```
+

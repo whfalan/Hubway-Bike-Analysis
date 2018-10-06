@@ -1,0 +1,208 @@
+---
+title: "Hubway Analysis"
+output: html_notebook
+---
+## Business Understanding
+Bike sharing programs such as Hubway has become more and more common in major cities in the world, as it reduces pollution, and provides people a cheap way to go from one place  to another without having to worry about storage and locking of their own bikes.
+To make such a program more efficient, we need to try to predict how long a person will take to return the bike, and what kind of user uses the bike, whether it’s a monthly or yearly subscriber, or a regular customer with a day pass.
+
+```{r}
+library(RMySQL)
+library(gmodels)
+library(class)
+library(caret)
+```
+Set up connection for MySQL
+```{r}
+con <- dbConnect(MySQL(),
+         user="root", password="alan980820",
+         dbname="Hubway", host="localhost")
+```
+Query to retrieve trip data from the database, combining it with the google distance matrix data and the station data
+```{r}
+data <- dbSendQuery(con, "SELECT starttime, stoptime, startstation, s1.stationname AS startname, s1.longitude AS startlongitude, s1.latitude AS startlatitude, endstation, s2.stationname AS endname, s2.longitude AS endlongitude, s2.latitude AS endlatitude, bikeid, customer, subscriber, birthyear, gender, Trips.duration AS tripduration, Google.duration AS gduration, shortestdistance AS gdist
+	FROM Trips 
+		JOIN Stations s1 ON Trips.startstation = s1.id
+		JOIN Stations s2 ON Trips.endstation = s2.id
+        JOIN Google ON Trips.id = Google.id
+	WHERE Google.duration > 0 AND startstation != endstation;")
+```
+
+Fetch the result from the query
+```{r}
+df <- dbFetch(data, n=-1)
+```
+Check to make sure that the dataframe contains information that we need
+```{r}
+summary(df)
+```
+Convert bikeid and station ids, birth year, and start and end station names to factor
+Also changing the time from character to POSIXct
+```{r}
+df$bikeid <- as.factor(df$bikeid)
+df$startstation <- as.factor(df$startstation)
+df$endstation <- as.factor(df$endstation)
+df$startname <- as.factor(df$startname)
+df$endname <- as.factor(df$endname)
+df$birthyear <- as.factor(df$birthyear)
+df$customer <- as.factor(df$customer)
+df$subscriber <- as.factor(df$subscriber)
+df$starttime <- as.POSIXct(df$starttime)
+df$stoptime <- as.POSIXct(df$stoptime)
+```
+
+```{r}
+summary(df)
+```
+
+Splitting Data into training and testing sets by taking 80% of data randomly for training, and 20% for validation.
+```{r}
+# Takes the index randomly
+train_index <- sample(1:nrow(df), 0.8 * nrow(df))
+test_index <- setdiff(1:nrow(df), train_index)
+#Seperate the data using the index the station latitude and longitude, along with the station names can be ignored since they change with the station id, so it is unecessary to have them in the model. 
+train <- df[train_index, c(1:3,7,11:17)]
+test <- df[test_index, c(1:3,7,11:17)]
+# Preparing the data for knn regression since it requires numeric normalized parameters.
+dfknn <- df[, c(1,2,5,6,9,10,12:17)]
+# change birth year to age, so it is numeric and can be normalized
+dfknn[, "age"] <- 2018-as.numeric(as.character(dfknn[, "birthyear"]))
+# Converting the time to numeric, as seconds elapsed
+dfknn$starttime <- as.numeric(dfknn$starttime)
+dfknn$stoptime <- as.numeric(dfknn$stoptime)
+# normalize the numeric variables
+dfknn$starttime <- (dfknn$starttime - min(dfknn$starttime)) / (max(dfknn$starttime) - min(dfknn$starttime))
+dfknn$stoptime <- (dfknn$stoptime - min(dfknn$stoptime)) / (max(dfknn$stoptime) - min(dfknn$stoptime))
+dfknn$startlongitude <- (dfknn$startlongitude - min(dfknn$startlongitude)) / (max(dfknn$startlongitude) - min(dfknn$startlongitude))
+dfknn$startlatitude <- (dfknn$startlatitude - min(dfknn$startlatitude)) / (max(dfknn$startlatitude) - min(dfknn$startlatitude))
+dfknn$endlongitude <- (dfknn$endlongitude - min(dfknn$endlongitude)) / (max(dfknn$endlongitude) - min(dfknn$endlongitude))
+dfknn$endlatitude <- (dfknn$endlatitude - min(dfknn$endlatitude)) / (max(dfknn$endlatitude) - min(dfknn$endlatitude))
+dfknn$gender <- (dfknn$gender - min(dfknn$gender)) / (max(dfknn$gender) - min(dfknn$gender))
+dfknn$tripduration <- (dfknn$tripduration - min(dfknn$tripduration)) / (max(dfknn$tripduration) - min(dfknn$tripduration))
+dfknn$gduration <- (dfknn$gduration - min(dfknn$gduration)) / (max(dfknn$gduration) - min(dfknn$gduration))
+dfknn$age <- (dfknn$age - min(dfknn$age)) / (max(dfknn$age) - min(dfknn$age))
+# Select all but the birth year, which is not needed, and the stoptime, which is calculated by starttime + tripduration, and the customer, because customer can be used to simply calculate subscriber, making the model useless
+trainknn <- dfknn[train_index, -c(2,7,9)]
+testknn <- dfknn[test_index, -c(2,7,9)]
+```
+
+## Multiple linear regression model to predict the trip durations
+Create a multiple linear regression model
+```{r}
+multlin <- lm(formula = tripduration ~., data = train)
+```
+
+```{r}
+summary(multlin)
+```
+From the summary above, we can tell that the least significant parameter based on p-value is bikeid, which is excluded in the new model. Another parameter that is excluded is the stoptime because including both start time and end time can easily result in calculation of trip duration, which makes the prediction pointless.
+```{r}
+multlin1 <- lm(formula = tripduration ~. -stoptime-bikeid, data = train)
+```
+
+```{r}
+summary(multlin)
+```
+This new model shows that the least significant parameters are the subscriber and the birth years. So these two will be excluded in the new model.
+```{r}
+multlin <- lm(formula = tripduration ~. -stoptime-bikeid-subscriber-birthyear, data = train)
+summary(multlin)
+```
+This model contains all the significant parameters, based on the fact that their p-values are under 0.05 thus the backward fitting is done.
+
+Evaluating the model:
+First of all, the Adjusted R-squared is only 0.397, which is considerably lower than desired. However, it is a expected due to the type of data that we have. It is difficult to predict how long someone will be riding Hubway bike solely based off the data collected in this dataset. It is mainly based on the time people take to travel between pick up and drop off stations, but sometimes people could take longer with the bike and not return it promptly, which is hard to be taken into account.
+Nowe we need to create a residual vs fitted graph to determin whether the residuals have a non-linear pattern.
+```{r}
+plot(multlin, which = 1)
+```
+This plot shows that there is no distinct pattern along the horizontal line, which means this is not a bad model, as there is less likely to be non linear relationship that is not explained by the model.
+
+Predicting the trip durations of the test data set
+```{r}
+removed <- c()
+# Remove the cases from the testing set where the factors didn't exist in training (i.e. in testing set may be cases with station id 200, but these may not exist in the training
+for (i in 1:ncol(test)) {
+  if (is.factor(test[, i])) {
+    for (j in 1:nrow(test)) {
+      if (!(test[j, i] %in% train[, i])) {
+        removed <- c(removed, j)
+      }
+    }
+  }
+}
+pred.test <- test[-removed, ]
+
+head(predict(multlin, newdata = pred.test, interval = "predict"))
+```
+These are a few examples of the predicted trip duration for these cases in the test set. For example, 14 can be interpreted as that there is 95% chance trip duration is from 421 to 2568. And the others can be interpreted similarly. These can be compared to the real result from the testing set.
+```{r}
+head(pred.test[, "tripduration"])
+```
+This shows that the results are very close to the predicted result, and all within the 95% confidence interval, which shoes that the predictions are not too far off.
+
+## Logistic Regression to predict whether a rider is a subscriber
+Logistic Regression. Using logistic regression, we attempt to find out whether a rider is a subscriber using parameters from the data set. Two parameters that are excluded are customer and stoptime. Customer is excluded because if someone wasn't a customer, then they must be a subscriber, so having customer would just reveal the answer. Stoptime is excluded because it is redundant, and you can simply calculate it from starttime and tripduration. Lastly, we also have to exclude birth year since the birth years for customers were missing, we had to impute them, including it may cause an inaccurate prediction. Furthermore, from the correlation analysis, we saw that the bikeid has almost no correlation with the usertype whether they are a subscriber or not, so it is excluded as well.
+```{r}
+logreg1 <- glm(subscriber ~ .-customer-stoptime-birthyear-bikeid, family=binomial(link='logit'),data=train)
+summary(logreg1)
+```
+This model shows that the startstation and endstation are not significant based on their p-values, and can be removed from the regression model
+```{r}
+logreg <- glm(subscriber ~ .-customer-stoptime-birthyear-bikeid-startstation-endstation, family=binomial(link='logit'),data=train)
+summary(logreg)
+```
+This model shows that all the remaining parameters are significant in predicting whether a rider is a subscriber or casual customer, as shown by the p values, which are way below 0.05.
+
+To evaluate this logistitic regression model, we run it on the testing set, and determine how often it is correct.
+```{r}
+prediction <- predict(logreg, newdata = test, type = 'response')
+prediction <- ifelse(prediction >0.5, 1, 0)
+accuracy <- mean(prediction != test$subscriber)
+print(paste0((1 - accuracy) * 100, '%'))
+```
+This shows that the regression model is a good fit for the problem with a 94% accuracy in predicting whether one is a subscriber or not.
+```{r}
+table(Truth = test$subscriber, Prediction = prediction)
+```
+This shows that it is more often that the model predicts someone is a subscriber while they are not, than predicting someone is not a subscriber when they actually. This shows a bias toward false positives.
+## kNN Regression anaylsis to predict the trip durations
+Creating a knn model, first using square root of number of observations in training as k
+```{r}
+knntestpred <- knn(trainknn[, -6], testknn[, -6], trainknn$subscriber, k=sqrt(nrow(trainknn)))
+```
+Return the accuracy of the prediction
+```{r}
+accuracy <- mean(knntestpred != testknn$subscriber)
+print(paste0((1 - accuracy) * 100, '%'))
+```
+With that k, the accuracy of the prediction is 94.36% 
+Now to tune the model, we need to test different k values and find the optimal one. We test every k value that is smaller than the square root of number of observations.
+```{r}
+optimalk <- NA
+optimalerror <- 1
+for (i in 3:sqrt(nrow(trainknn))) {
+  error <- mean(knn(trainknn[, -6], testknn[, -6], trainknn$subscriber, k=i) != testknn$subscriber)
+  if (error < optimalerror) {
+    optimalk <- i
+  }
+}
+optimalk
+```
+This shows that the optimal k is 5, which results in the lowest error
+Now we have to evaluate the model and decide if it is accurate
+```{r}
+optimalknn <- knn(trainknn[, -6], testknn[, -6], trainknn$subscriber, k=5)
+accuracyknn <- mean(optimalknn != testknn$subscriber)
+print(paste0((1 - accuracyknn) * 100, '%'))
+```
+This shows that the kNN model is more accurate than the logistic regression in predicting whether a person is a subscriber or not.
+```{r}
+table(Truth = testknn$subscriber, Prediction = optimalknn)
+```
+This shows that the kNN model has a bias toward false positives just like the logistic regression model, however, it is more accurate.
+
+## Evaluation:
+Multiple Linear Regression for predicting trip duration is not a great model, as it has a very wide range when predicting, and also a high MAD. This can be the result of a lack of parameters used, such as individual profiles that may show trends for each person, which makes it difficult to predict trip durations. 
+
+Between the kNN model and the logistic regression model to predict subscribers, the kNN model clearly is more accurate. However, to avoid mislabeling a subscriber as a customer, or vice versa, perhaps both should be looked at, with more weight put into kNN model.
